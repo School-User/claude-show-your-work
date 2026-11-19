@@ -49,6 +49,9 @@ export const state = {
   // shows a warning with the way back instead. (Coloured half-block cells were
   // tried as a fallback: unreadable.)
   canImage: true,
+  // Pictures drawn as coloured half-block text (textpic.ts): the terminal can't
+  // paint Claude Code's pictures, or SHOW_YOUR_WORK_TEXT=1.
+  textMode: false,
   probed: false,
   sessionId: '',
   drawCause: 'background' as DrawCause,

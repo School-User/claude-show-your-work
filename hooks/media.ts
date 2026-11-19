@@ -76,7 +76,8 @@ export async function locate($: EngineInterface, raw: string): Promise<string> {
 // real time and playback froze; raw cut at 0.9x with a fifth of the CPU.
 // PNG only where raw can't go: pictures sent as bytes (ssh: 4.7 MB a frame
 // through the connection) or a terminal that reads small files only (Orca).
-export const usesRaw = () => !state.sendBytes && readsAnyFile()
+// Text mode reads every frame itself, so raw frames need no terminal at all.
+export const usesRaw = () => state.textMode || (!state.sendBytes && readsAnyFile())
 // Each raw folder's frame size, for the terminal (a raw file has no header).
 const rawSizes = new Map<string, { width: number; height: number }>()
 export function frameFile(frames: Frames, i: number) {

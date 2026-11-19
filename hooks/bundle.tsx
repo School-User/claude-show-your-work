@@ -377,7 +377,8 @@ export async function locate($: EngineInterface, raw: string): Promise<string> {
 // real time and playback froze; raw cut at 0.9x with a fifth of the CPU.
 // PNG only where raw can't go: pictures sent as bytes (ssh: 4.7 MB a frame
 // through the connection) or a terminal that reads small files only (Orca).
-export const usesRaw = () => !state.sendBytes && readsAnyFile()
+// Text mode reads every frame itself, so raw frames need no terminal at all.
+export const usesRaw = () => state.textMode || (!state.sendBytes && readsAnyFile())
 // Each raw folder's frame size, for the terminal (a raw file has no header).
 const rawSizes = new Map<string, { width: number; height: number }>()
 export function frameFile(frames: Frames, i: number) {
@@ -2260,6 +2261,100 @@ export async function stopForwarding($: EngineInterface) {
   await Promise.resolve().then(() => $.process.run(['tmux', 'pipe-pane', '-t', pane])).catch(() => undefined)
 }
 
+// ── textpic.ts ────────────────────────────────────────────────────────────
+// Text mode: a picture drawn as coloured half-block cells, for terminals that
+// can't paint Claude Code's kitty pictures (foot, Alacritty, WezTerm, Warp,
+// Konsole, xterm, tmux without passthrough). Each cell is '▀' with the upper
+// pixel as the foreground colour and the lower as the background, so a box of
+// C x R cells shows C x 2R pixels. It's plain text with 24-bit colour, so
+// Claude Code redraws it like any other row and nothing depends on a graphics
+// protocol. Low resolution by nature: View opens the full picture.
+
+// Terminals that draw Claude Code's own pictures; every other one gets text.
+const DRAWS_IMAGES = new Set(['ghostty', 'kitty', 'iterm2', 'rex', 'herdr_app'])
+export const isTextTerminal = (name: string) => !DRAWS_IMAGES.has(name)
+
+// The rows last drawn, by file and box: a redraw of an unchanged frame reads
+// and samples nothing.
+const textRowsCache = new Map<string, TextRow[]>()
+const TEXT_KEEP = 32
+
+// One row of half-blocks, as runs of cells that share both colours. Claude
+// Code refuses escape sequences inside Text, so each run becomes a Text with
+// its own color and backgroundColor.
+export type TextRun = { fg: string; bg: string; n: number }
+export type TextRow = TextRun[]
+
+// Pixels (RGB, width x height) to `rows` rows of `cols` half-blocks. Each
+// cell's two colours are the average of the source block under it, sampled at
+// most 4 x 4 so a big frame costs no more than a small one, and rounded to
+// steps of 8 per channel so flat areas merge into one run.
+export function halfBlocks(px: Uint8Array, width: number, height: number, cols: number, rows: number): TextRow[] {
+  const hex = (v: number) => Math.min(255, Math.round(v / 8) * 8).toString(16).padStart(2, '0')
+  const avg = (x0: number, x1: number, y0: number, y1: number) => {
+    const sx = Math.max(1, Math.floor((x1 - x0) / 4))
+    const sy = Math.max(1, Math.floor((y1 - y0) / 4))
+    let r = 0, g = 0, b = 0, n = 0
+    for (let y = y0; y < y1; y += sy) for (let x = x0; x < x1; x += sx) {
+      const i = (y * width + x) * 3
+      r += px[i] ?? 0; g += px[i + 1] ?? 0; b += px[i + 2] ?? 0; n++
+    }
+    return `#${hex(r / n)}${hex(g / n)}${hex(b / n)}`
+  }
+  const span = (i: number, of: number, size: number): [number, number] => {
+    const a = Math.min(size - 1, Math.floor((i * size) / of))
+    return [a, Math.max(a + 1, Math.min(size, Math.floor(((i + 1) * size) / of)))]
+  }
+  const out: TextRow[] = []
+  for (let row = 0; row < rows; row++) {
+    const [t0, t1] = span(row * 2, rows * 2, height)
+    const [b0, b1] = span(row * 2 + 1, rows * 2, height)
+    const runs: TextRow = []
+    for (let col = 0; col < cols; col++) {
+      const [x0, x1] = span(col, cols, width)
+      const fg = avg(x0, x1, t0, t1)
+      const bg = avg(x0, x1, b0, b1)
+      const last = runs.at(-1)
+      if (last && last.fg === fg && last.bg === bg) last.n++
+      else runs.push({ fg, bg, n: 1 })
+    }
+    out.push(runs)
+  }
+  return out
+}
+
+// A picture or frame file as text rows for a box, or null when it can't be
+// read. A raw video frame is sampled as it is; a PNG (or any picture) is first
+// scaled by ffmpeg to exactly the box's pixels.
+export async function textRowsOf($: EngineInterface, file: string, columns: number, rows: number): Promise<TextRow[] | null> {
+  const cols = Math.max(1, Math.round(columns))
+  const lineCount = Math.max(1, Math.round(rows))
+  const raw = rawSizeOf(file)
+  const st = raw ? null : await Promise.resolve().then(() => $.fs.stat(file)).catch(() => null)
+  if (!raw && !st) return null
+  const key = `${file}|${cols}x${lineCount}|${st ? `${st.size}|${st.mtimeMs}` : ''}`
+  const known = textRowsCache.get(key)
+  if (known) return known
+  let pixels = file
+  const pxWide = raw?.width ?? cols
+  const pxHigh = raw?.height ?? lineCount * 2
+  if (!raw) {
+    pixels = `${state.TMP}/t-${keyOf(key)}.rgb`
+    const r = await Promise.resolve()
+      .then(() => $.process.run([state.ffmpeg, '-v', 'error', '-y', '-i', file, '-frames:v', '1', '-vf', `scale=${pxWide}:${pxHigh}:flags=area,format=rgb24`, '-f', 'rawvideo', pixels]))
+      .catch(() => null)
+    if (!r || r.exitCode !== 0) return null
+  }
+  const loaded = await Promise.resolve().then(() => $.fs.read(pixels, { as: 'bytes' })).catch(() => null)
+  if (!loaded?.base64) return null
+  const px = Uint8Array.from(atob(loaded.base64), c => c.charCodeAt(0))
+  if (px.length < pxWide * pxHigh * 3) return null
+  const lines = halfBlocks(px, pxWide, pxHigh, cols, lineCount)
+  textRowsCache.set(key, lines)
+  if (textRowsCache.size > TEXT_KEEP) textRowsCache.delete(textRowsCache.keys().next().value!)
+  return lines
+}
+
 // ── sound.ts ──────────────────────────────────────────────────────────────
 // A video's sound, beside its frames. On by default, with Mute for the session,
 // only once the person presses Play.
@@ -2864,16 +2959,33 @@ export async function pngSource($: EngineInterface, file: string): Promise<Sourc
 }
 
 // What draws a picture: the Image's source.
-type Pic = { src: Source }
+// In text mode, the rows of half-blocks drawn instead (null: not readable yet).
+type Pic = { src: Source; text?: TextRow[] | null }
 
-async function picFor($: EngineInterface, file: string, _box: { columns: number; rows: number }): Promise<Pic> {
+async function picFor($: EngineInterface, file: string, box: { columns: number; rows: number }): Promise<Pic> {
+  if (state.textMode) return { src: { file, format: 'png' as const }, text: await textRowsOf($, file, box.columns, box.rows) }
   return { src: await pngSource($, file) }
+}
+
+// Text mode's picture: one Text per row of half-blocks.
+function TextPicture(ui: Ui, rows: TextRow[] | null | undefined, box: { columns: number; rows: number }) {
+  const { Box, Text } = ui
+  if (!rows) return <Box width={box.columns} height={box.rows} justifyContent="center" alignItems="center"><Text dimColor>Loading…</Text></Box>
+  return (
+    <Box flexDirection="column" width={box.columns} height={box.rows}>
+      {rows.map((runs, i) => (
+        <Text key={`text-row-${i}`} wrap="truncate">
+          {runs.map((run, k) => <Text key={`text-run-${i}-${k}`} color={run.fg} backgroundColor={run.bg}>{'▀'.repeat(run.n)}</Text>)}
+        </Text>
+      ))}
+    </Box>
+  )
 }
 
 // After a first draw, asks whether the picture really drew; if the terminal
 // can only show the alt text, switches every picture to cells.
 function probe($: EngineInterface, site: string, key: string, pic: Pic) {
-  if (!state.canImage || state.probed) return
+  if (!state.canImage || state.probed || state.textMode) return
   state.probed = true
   void $.clock.sleep(250).then(async () => {
     // A video playing by now shows a later frame: send that one, not the
@@ -2925,7 +3037,8 @@ function resized($: EngineInterface, site: string, media: Shown, shown: Shown, b
   one.box = { columns: box.columns, rows: box.rows }
   one.boxGeneration = ++boxGenerations
   event('resize', { site, from: was ? `${was.columns}x${was.rows}` : null, to: `${box.columns}x${box.rows}`, generation: one.boxGeneration })
-  if (!was) return
+  // Text mode draws the rows for the new box in that same render: nothing to resend.
+  if (!was || state.textMode) return
   // Dragging a window edge changes the box many times, and a frame swap in
   // flight can land at the old size after Claude Code has drawn the new one.
   // Once the box has held for SETTLE_MS the frame on screen is sent again, and
@@ -2949,6 +3062,16 @@ const AGAIN_MS = 750
 const boxGenerationOf = (site: string) => players.get(site)?.boxGeneration ?? 0
 async function blit($: EngineInterface, site: string, key: string, media: Shown, file: string, frame: number, ticket = ++tickets) {
   if (!state.canImage) return
+  // Text mode has no picture to swap: the frame's rows are made here, outside
+  // a render (which a newer render would cancel), and the player redraws.
+  if (state.textMode) {
+    const box = players.get(site)?.box
+    if (box) await textRowsOf($, file, box.columns, box.rows)
+    const lane = swaps.get(`${site}|${key}`) ?? { isBusy: false, ticket: 0 }
+    lane.last = file
+    swaps.set(`${site}|${key}`, lane)
+    return redraw($, site)
+  }
   const id = `${site}|${key}`
   let lane = swaps.get(id)
   if (!lane) swaps.set(id, (lane = { isBusy: false, ticket: 0 }))
@@ -3297,6 +3420,11 @@ type Box = { columns: number; rows: number }
 // The picture.
 function Picture(ui: Ui, $: EngineInterface, site: string, shown: Shown, media: Shown, box: Box, pic: Pic, frame: Box = box) {
   const { Box, Text, Image } = ui
+  if (state.textMode) {
+    const text = TextPicture(ui, pic.text, box)
+    if (frame.columns === box.columns && frame.rows === box.rows) return text
+    return <Box width={frame.columns} height={frame.rows} justifyContent="center" alignItems="center">{text}</Box>
+  }
   if (!Image) return <Text dimColor>This surface cannot draw images.</Text>
 
   // The picture stands alone: no wrapper, nothing laid over it and no fill
@@ -4079,7 +4207,7 @@ export async function Viewer(
   // Each side is drawn from the copy that fits its box (see fitCopy).
   // iTerm2 scales a picture into its box itself, so it never needs a copy
   // fitted to the box (which also shrank the box after the first draw).
-  if (state.cell && state.terminalName !== 'iterm2') for (const side of [media, other]) if (side && side.kind !== 'document') fitCopy($, site, side, pixelsFor(targetBox(side.width, side.height, layout, state.cell), state.cell, side.width / side.height))
+  if (state.cell && state.terminalName !== 'iterm2' && !state.textMode) for (const side of [media, other]) if (side && side.kind !== 'document') fitCopy($, site, side, pixelsFor(targetBox(side.width, side.height, layout, state.cell), state.cell, side.width / side.height))
   // This side's own box, and the frame it sits in: Original and Updated
   // share the larger of their two boxes, so switching never moves the layout
   // and each side draws whole at its own size, centred.
@@ -4299,7 +4427,7 @@ async function SplitView(
           {head(before, 'Original', half)}
           {head(shown, 'Updated', box.columns - half)}
         </Box>
-        {Image ? (
+        {state.textMode ? TextPicture(ui, pic.text, box) : Image ? (
           <Image key="view-pair" source={'file' in pic.src ? { ...pic.src, generation: boxGenerationOf(site) } : pic.src} columns={box.columns} rows={box.rows} alt="[original and updated, side by side]" />
         ) : (
           <Text dimColor>This surface cannot draw images.</Text>
@@ -4394,6 +4522,9 @@ export const state = {
   // shows a warning with the way back instead. (Coloured half-block cells were
   // tried as a fallback: unreadable.)
   canImage: true,
+  // Pictures drawn as coloured half-block text (textpic.ts): the terminal can't
+  // paint Claude Code's pictures, or SHOW_YOUR_WORK_TEXT=1.
+  textMode: false,
   probed: false,
   sessionId: '',
   drawCause: 'background' as DrawCause,
@@ -5359,7 +5490,12 @@ export const register: Register = on => {
       const isDesktop = (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) === 'claude-desktop'
       // Rex and the Herdr app draw nothing until Claude Code starts with FORCE.
       const isOff = !state.inTmux && !!UNRECOGNISED[state.terminalName] && !state.isForced
-      if (isDesktop || (state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName] || isOff) {
+      // Any terminal that can't paint Claude Code's pictures (foot, Alacritty,
+      // WezTerm, Warp, Konsole, tmux without passthrough) gets them as coloured
+      // half-block text instead (textpic.ts); SHOW_YOUR_WORK_TEXT=1 forces it.
+      const isTextForced = /^(1|true|on|yes)$/i.test((await $.env.get('SHOW_YOUR_WORK_TEXT')) ?? '')
+      state.textMode = !isDesktop && (isTextForced || (state.inTmux ? !isForwarded : isTextTerminal(state.terminalName)))
+      if (!state.textMode && (isDesktop || (state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName] || isOff)) {
         state.canImage = false
         state.probed = true
         state.drawCause = isDesktop ? 'desktop' : NO_PLACEHOLDERS[state.terminalName] ? 'terminal' : causeOf(state.inTmux, state.terminalName, state.isForced)

@@ -13,6 +13,8 @@ import { prepared, preparedOf } from './history'
 import { docPage, documentView } from './document'
 import { tourHeard } from './tour'
 import { FORCE } from './tmux'
+import { textRowsOf } from './textpic'
+import type { TextRow } from './textpic'
 import { haltAllSound, haltSound, measureLatency, prepareSound, probeSound, SOUND_HOLD_MAX_MS, SOUND_RESTARTS, SOUND_TAIL_S, SOUND_WAIT_MS, soundLeft, soundNow, soundTrack, soundUsable, startSound } from './sound'
 
 // Playback per drawn site (a transcript row's tool_use_id, or the pane).
@@ -354,16 +356,33 @@ export async function pngSource($: EngineInterface, file: string): Promise<Sourc
 }
 
 // What draws a picture: the Image's source.
-type Pic = { src: Source }
+// In text mode, the rows of half-blocks drawn instead (null: not readable yet).
+type Pic = { src: Source; text?: TextRow[] | null }
 
-async function picFor($: EngineInterface, file: string, _box: { columns: number; rows: number }): Promise<Pic> {
+async function picFor($: EngineInterface, file: string, box: { columns: number; rows: number }): Promise<Pic> {
+  if (state.textMode) return { src: { file, format: 'png' as const }, text: await textRowsOf($, file, box.columns, box.rows) }
   return { src: await pngSource($, file) }
+}
+
+// Text mode's picture: one Text per row of half-blocks.
+function TextPicture(ui: Ui, rows: TextRow[] | null | undefined, box: { columns: number; rows: number }) {
+  const { Box, Text } = ui
+  if (!rows) return <Box width={box.columns} height={box.rows} justifyContent="center" alignItems="center"><Text dimColor>Loading…</Text></Box>
+  return (
+    <Box flexDirection="column" width={box.columns} height={box.rows}>
+      {rows.map((runs, i) => (
+        <Text key={`text-row-${i}`} wrap="truncate">
+          {runs.map((run, k) => <Text key={`text-run-${i}-${k}`} color={run.fg} backgroundColor={run.bg}>{'▀'.repeat(run.n)}</Text>)}
+        </Text>
+      ))}
+    </Box>
+  )
 }
 
 // After a first draw, asks whether the picture really drew; if the terminal
 // can only show the alt text, switches every picture to cells.
 function probe($: EngineInterface, site: string, key: string, pic: Pic) {
-  if (!state.canImage || state.probed) return
+  if (!state.canImage || state.probed || state.textMode) return
   state.probed = true
   void $.clock.sleep(250).then(async () => {
     // A video playing by now shows a later frame: send that one, not the
@@ -415,7 +434,8 @@ function resized($: EngineInterface, site: string, media: Shown, shown: Shown, b
   one.box = { columns: box.columns, rows: box.rows }
   one.boxGeneration = ++boxGenerations
   event('resize', { site, from: was ? `${was.columns}x${was.rows}` : null, to: `${box.columns}x${box.rows}`, generation: one.boxGeneration })
-  if (!was) return
+  // Text mode draws the rows for the new box in that same render: nothing to resend.
+  if (!was || state.textMode) return
   // Dragging a window edge changes the box many times, and a frame swap in
   // flight can land at the old size after Claude Code has drawn the new one.
   // Once the box has held for SETTLE_MS the frame on screen is sent again, and
@@ -439,6 +459,16 @@ const AGAIN_MS = 750
 const boxGenerationOf = (site: string) => players.get(site)?.boxGeneration ?? 0
 async function blit($: EngineInterface, site: string, key: string, media: Shown, file: string, frame: number, ticket = ++tickets) {
   if (!state.canImage) return
+  // Text mode has no picture to swap: the frame's rows are made here, outside
+  // a render (which a newer render would cancel), and the player redraws.
+  if (state.textMode) {
+    const box = players.get(site)?.box
+    if (box) await textRowsOf($, file, box.columns, box.rows)
+    const lane = swaps.get(`${site}|${key}`) ?? { isBusy: false, ticket: 0 }
+    lane.last = file
+    swaps.set(`${site}|${key}`, lane)
+    return redraw($, site)
+  }
   const id = `${site}|${key}`
   let lane = swaps.get(id)
   if (!lane) swaps.set(id, (lane = { isBusy: false, ticket: 0 }))
@@ -787,6 +817,11 @@ type Box = { columns: number; rows: number }
 // The picture.
 function Picture(ui: Ui, $: EngineInterface, site: string, shown: Shown, media: Shown, box: Box, pic: Pic, frame: Box = box) {
   const { Box, Text, Image } = ui
+  if (state.textMode) {
+    const text = TextPicture(ui, pic.text, box)
+    if (frame.columns === box.columns && frame.rows === box.rows) return text
+    return <Box width={frame.columns} height={frame.rows} justifyContent="center" alignItems="center">{text}</Box>
+  }
   if (!Image) return <Text dimColor>This surface cannot draw images.</Text>
 
   // The picture stands alone: no wrapper, nothing laid over it and no fill
@@ -1569,7 +1604,7 @@ export async function Viewer(
   // Each side is drawn from the copy that fits its box (see fitCopy).
   // iTerm2 scales a picture into its box itself, so it never needs a copy
   // fitted to the box (which also shrank the box after the first draw).
-  if (state.cell && state.terminalName !== 'iterm2') for (const side of [media, other]) if (side && side.kind !== 'document') fitCopy($, site, side, pixelsFor(targetBox(side.width, side.height, layout, state.cell), state.cell, side.width / side.height))
+  if (state.cell && state.terminalName !== 'iterm2' && !state.textMode) for (const side of [media, other]) if (side && side.kind !== 'document') fitCopy($, site, side, pixelsFor(targetBox(side.width, side.height, layout, state.cell), state.cell, side.width / side.height))
   // This side's own box, and the frame it sits in: Original and Updated
   // share the larger of their two boxes, so switching never moves the layout
   // and each side draws whole at its own size, centred.
@@ -1789,7 +1824,7 @@ async function SplitView(
           {head(before, 'Original', half)}
           {head(shown, 'Updated', box.columns - half)}
         </Box>
-        {Image ? (
+        {state.textMode ? TextPicture(ui, pic.text, box) : Image ? (
           <Image key="view-pair" source={'file' in pic.src ? { ...pic.src, generation: boxGenerationOf(site) } : pic.src} columns={box.columns} rows={box.rows} alt="[original and updated, side by side]" />
         ) : (
           <Text dimColor>This surface cannot draw images.</Text>

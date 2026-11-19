@@ -12,6 +12,9 @@ hooks/diagnostics.ts) and fails if the plugin noticed any problem.
     python3 tools/pty-harness.py tour            the tour's first video, half width to full and back
     python3 tools/pty-harness.py scroll          five pictures and a playing video, then scroll up
 
+    --foot           answer like foot (TERM=foot, no kitty graphics): text mode
+    --png out.png    save the final screen, colours and half-blocks, as a picture
+
 Clicking and scrolling read the screen, which needs pyte:
     python3 -m venv /tmp/syw-venv && /tmp/syw-venv/bin/pip install pyte
     /tmp/syw-venv/bin/python tools/pty-harness.py video
@@ -43,10 +46,13 @@ class Terminal:
         self.screen = pyte.Screen(columns, rows) if pyte else None
         self.stream = pyte.ByteStream(self.screen) if pyte else None
         env = dict(os.environ, TERM_PROGRAM='ghostty', TERM='xterm-ghostty', COLORTERM='truecolor', SHOW_YOUR_WORK_DEBUG='1')
+        if FOOT:
+            env.pop('TERM_PROGRAM', None)
+            env.update(TERM='foot')
         args = ['claude', '--plugin-dir', ROOT, '--settings', '{"enabledPlugins":{"show-your-work@iamumeransari":false}}']
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
-            os.chdir(ROOT)
+            os.chdir(os.environ.get('SYW_HARNESS_CWD', ROOT))
             os.execvpe('claude', args, env)
         self.size(columns, rows)
 
@@ -57,6 +63,10 @@ class Terminal:
     # is answered before the device-attributes query that follows it, or the
     # probe counts as unanswered and no picture is ever sent.
     def answer(self, data):
+        if FOOT:
+            if b'\x1b[c' in data:
+                os.write(self.fd, b'\x1b[?62;4;22c')
+            return
         for query in re.findall(rb'\x1b_G([^;\x1b]*)', data):
             fields = dict(p.split(b'=', 1) for p in query.split(b',') if b'=' in p)
             if fields.get(b'a') == b'q' and b'i' in fields:
@@ -156,6 +166,12 @@ def run(scenario, file):
         os.remove(LOG)
     term = Terminal(*FULL)
     term.pump(14)
+    # A folder Claude Code hasn't been told to trust asks first: say yes.
+    if term.screen and any('trust this folder' in line for line in term.screen.display):
+        os.write(term.fd, b'\x1b[B')
+        term.pump(0.5)
+        os.write(term.fd, b'\r')
+        term.pump(10)
     if scenario == 'image':
         term.type(f'/img {file or os.path.join(ROOT, "assets/tour/hero.jpg")}')
         term.pump(6)
@@ -235,7 +251,45 @@ def report(term):
     return 1 if found else 0
 
 
+# The pyte screen as a picture: each cell its background, a half-block its
+# two colours, other characters drawn in their foreground. Needs Pillow.
+def save_png(term, path):
+    from PIL import Image, ImageDraw
+    cw, ch = 8, 16
+    screen = term.screen
+    img = Image.new('RGB', (screen.columns * cw, screen.lines * ch), (24, 24, 24))
+    draw = ImageDraw.Draw(img)
+    def rgb(c, fallback):
+        return '#' + c if re.fullmatch(r'[0-9a-fA-F]{6}', c or '') else fallback
+    for y in range(screen.lines):
+        row = screen.buffer[y]
+        for x in range(screen.columns):
+            cell = row[x]
+            fg, bg = rgb(cell.fg, '#dddddd'), rgb(cell.bg, '#181818')
+            if cell.reverse:
+                fg, bg = bg, fg
+            box = (x * cw, y * ch, x * cw + cw - 1, y * ch + ch - 1)
+            if cell.data == '▀':
+                draw.rectangle((box[0], box[1], box[2], box[1] + ch // 2 - 1), fill=fg)
+                draw.rectangle((box[0], box[1] + ch // 2, box[2], box[3]), fill=bg)
+            else:
+                draw.rectangle(box, fill=bg)
+                if cell.data.strip():
+                    draw.text((x * cw, y * ch), cell.data, fill=fg)
+    img.save(path)
+
+
+FOOT = '--foot' in sys.argv
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
+    argv = [a for a in sys.argv[1:] if a != '--foot']
+    png = None
+    if '--png' in argv:
+        i = argv.index('--png')
+        png = argv[i + 1]
+        del argv[i:i + 2]
+    if not argv:
         sys.exit(__doc__)
-    sys.exit(report(run(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)))
+    done = run(argv[0], argv[1] if len(argv) > 1 else None)
+    if png and done.screen:
+        save_png(done, png)
+    sys.exit(report(done))

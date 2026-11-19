@@ -12,6 +12,7 @@ A Claude Code plugin that draws pictures and videos in the chat, in Ghostty and 
 - `player.tsx`: playback and the player's components
 - `sound.ts`: a video's sound beside its frames (ffplay), off until Unmute
 - `tmux.ts`: passing Claude Code's pictures through tmux
+- `textpic.ts`: text mode, pictures as coloured half-blocks in terminals that can't paint Claude Code's pictures (see `docs/technical/text-mode.md`)
 - `onboarding.tsx` and `tour.ts`: settings, welcome and tour
 - `telemetry.ts` and `updater.ts`: usage stats and updates
 - `diagnostics.ts`: the local debug log (structured events and problems) and `/show-your-work diagnose`; never sent anywhere

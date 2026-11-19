@@ -78,6 +78,7 @@ Making an ad, an animation or a launch video? Each cut plays right in the chat, 
 
 show-your-work supports Ghostty and kitty, on macOS and Linux. Pictures work there straight away.
 
+- **foot, Alacritty, xterm, GNOME Terminal, WezTerm, Warp, Konsole and tmux (text mode):** pictures and videos draw as coloured half-block text, 2 pixels per cell. It's low resolution, but it shows inline in any terminal with 24-bit colour. View opens the full picture. Set `SHOW_YOUR_WORK_TEXT=1` to use it anywhere.
 - **Rex and the Herdr app:** pictures and videos draw, but Claude Code only turns them on there when it starts with `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1`. The notice's Turn on pictures button adds a line to your shell profile that sets it in that terminal only, and copies a command to reopen the chat.
 - **Warp, WezTerm and Konsole:** these support the kitty graphics protocol, but not the Unicode placeholders Claude Code draws pictures with, so pictures can't show in them yet.
 - **Other terminals built on Ghostty or kitty:** Claude Code doesn't recognise them and leaves pictures off. Start it with `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` (the notice copies a command that does this), or add `export CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` to your shell profile.

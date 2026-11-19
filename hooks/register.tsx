@@ -14,6 +14,7 @@ import { setUp } from './setup'
 import { haltAllSound, soundUsable } from './sound'
 import { isDocument, prepareDocument } from './document'
 import { forwardPictures, stopForwarding } from './tmux'
+import { isTextTerminal } from './textpic'
 import { CLEAN_SH, exists, expand, findPasted, identityOf, isAudio, isPage, keyOf, locate, NO_FFMPEG, noticeOf, prepare, preparePair, renderPage, REASONS, shiftTimes, trimFrames, VIDEO } from './media'
 import type { Notice } from './media'
 import { handleOf, MARK, noteOf, preparedOf, remember, shownById, shownOf, storeOf, storeVersion, textOf, timesThatMean, versionsOf } from './history'
@@ -124,7 +125,12 @@ export const register: Register = on => {
       const isDesktop = (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) === 'claude-desktop'
       // Rex and the Herdr app draw nothing until Claude Code starts with FORCE.
       const isOff = !state.inTmux && !!UNRECOGNISED[state.terminalName] && !state.isForced
-      if (isDesktop || (state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName] || isOff) {
+      // Any terminal that can't paint Claude Code's pictures (foot, Alacritty,
+      // WezTerm, Warp, Konsole, tmux without passthrough) gets them as coloured
+      // half-block text instead (textpic.ts); SHOW_YOUR_WORK_TEXT=1 forces it.
+      const isTextForced = /^(1|true|on|yes)$/i.test((await $.env.get('SHOW_YOUR_WORK_TEXT')) ?? '')
+      state.textMode = !isDesktop && (isTextForced || (state.inTmux ? !isForwarded : isTextTerminal(state.terminalName)))
+      if (!state.textMode && (isDesktop || (state.inTmux && !isForwarded) || NO_PLACEHOLDERS[state.terminalName] || isOff)) {
         state.canImage = false
         state.probed = true
         state.drawCause = isDesktop ? 'desktop' : NO_PLACEHOLDERS[state.terminalName] ? 'terminal' : causeOf(state.inTmux, state.terminalName, state.isForced)
